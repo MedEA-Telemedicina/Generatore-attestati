@@ -373,6 +373,39 @@ function resetForm() {
   const list = document.getElementById('farmacistiList');
   list.innerHTML = '<div class="farmacista-row"><input type="text" placeholder="Nome e Cognome" class="farmacista-input" /><button class="btn-remove" onclick="rimuoviFarmacista(this)" title="Rimuovi">×</button></div>';
 }
+// ── Sfondo bianco → trasparente (JPEG → PNG) ─────────────────────────────────
+// La firma JPEG ha sfondo bianco che coprirebbe la riga del template.
+// Usiamo un canvas per rendere trasparenti i pixel bianchi/chiari,
+// poi incorporiamo il risultato come PNG (che supporta la trasparenza).
+function makeSignatureTransparent(b64jpeg) {
+  return new Promise(resolve => {
+    const img = new Image();
+    img.onload = () => {
+      const SCALE   = 3; // upscale 3× → ~216 DPI nel PDF invece di ~72 DPI
+      const canvas = document.createElement('canvas');
+      canvas.width  = img.naturalWidth  * SCALE;
+      canvas.height = img.naturalHeight * SCALE;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      const id = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const d  = id.data;
+      for (let i = 0; i < d.length; i += 4) {
+        // Luminosità percettiva
+        const lum = d[i] * 0.299 + d[i+1] * 0.587 + d[i+2] * 0.114;
+        if (lum > 245) {
+          d[i+3] = 0;                                     // bianco puro → trasparente
+        } else if (lum > 190) {
+          d[i+3] = Math.round(255 * (1 - (lum - 190) / 55)); // zona di transizione
+        }
+        // pixel scuri (inchiostro) → rimangono opachi
+      }
+      ctx.putImageData(id, 0, 0);
+      resolve(canvas.toDataURL('image/png').split(',')[1]);
+    };
+    img.src = `data:image/jpeg;base64,${b64jpeg}`;
+  });
+}
+
 // ── Generazione PDF ──────────────────────────────────────────────────────────
 async function generaAttestati() {
   const farmacia  = document.getElementById('farmacia').value.trim();
@@ -486,18 +519,35 @@ async function generaAttestati() {
       // Incorpora e disegna la firma
       // Coordinate PDF-lib (origine in basso a sinistra)
       // IL FORMATORE è centrato intorno a x=567, sopra di esso mettiamo la firma
-      const sigBytes = b64ToBytes(SIGNATURES[formatore]);
-      const sigImage = await pdfDoc.embedJpg(sigBytes);
+      // Convertiamo prima la JPEG in PNG trasparente → lo sfondo bianco non copre la riga
+      const sigPngBase64 = await makeSignatureTransparent(SIGNATURES[formatore]);
+      const sigImage = await pdfDoc.embedPng(b64ToBytes(sigPngBase64));
 
-      const SIG_CENTER_X = 564.7;  // centro area formatore
-      const SIG_BOTTOM_Y  = 90;    // y di base (pdf-lib)
-      const SIG_MAX_W     = 200;
-      const SIG_MAX_H     = 80;
+      const SIG_CENTER_X    = 564.7;  // centro area formatore
+      const SIG_LINE_Y      = 90;     // y della riga nel PDF (pdf-lib, origine in basso)
+      const SIG_MAX_W       = 230;    // aumentato per maggiore qualità
+      const SIG_MAX_H       = 100;    // aumentato per maggiore qualità
+
+      // Percentuale dell'altezza dell'immagine occupata dai discendenti (g, y, p…)
+      // Questi andranno SOTTO la riga; il resto (corpo della firma) starà SOPRA.
+      const DESCENDER_RATIO = 0.22;
+
+      // Offset verticale aggiuntivo per abbassare la firma (valori negativi = più in basso)
+      const SIG_OFFSET_Y = (formatore === 'GIOVANNI CAFARO' || formatore === 'GIANMARCO PALAZZO')
+        ? -12   // questi due formatori: firma più bassa
+        : 0;
 
       const dims = sigImage.scaleToFit(SIG_MAX_W, SIG_MAX_H);
+
+      // Posizioniamo l'immagine in modo che la baseline coincida con SIG_LINE_Y:
+      //   bottom dell'immagine = SIG_LINE_Y - (altezza discendenti)
+      //   → i discendenti scendono sotto la riga
+      //   → il corpo della firma rimane sopra la riga
+      const sigY = SIG_LINE_Y - dims.height * DESCENDER_RATIO + SIG_OFFSET_Y;
+
       page.drawImage(sigImage, {
         x: SIG_CENTER_X - dims.width / 2,
-        y: SIG_BOTTOM_Y,
+        y: sigY,
         width:  dims.width,
         height: dims.height,
       });
